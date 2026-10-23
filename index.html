@@ -228,7 +228,7 @@ nav.tabs button[aria-current="page"]{color:var(--amber)}
    Game lines, team ratings, multi book price shopping, bet ledger with
    closing line value, and Send to War Room.
    ===================================================================== */
-const VERSION = '1.0.1';
+const VERSION = '1.1.0';
 const SOURCE_APP = 'hardwood_nba';
 const WAR_ROOM_DEFAULT = 'https://lighthearted-kringle-dafe7e.netlify.app/import/receive';
 
@@ -292,7 +292,7 @@ const bookShort = (k, title) => { const b = BOOKS.find(x => x[0] === k); return 
 
 const DEFAULTS = {
   oddsKey: '', regions: 'us', myBooks: ['draftkings','fanduel','betmgm','williamhill_us','fanatics'],
-  unit: 10, minEv: 0.03, staleHours: 3, slateDays: 3, wSide: 0.10, wTotal: 0.0,
+  unit: 10, minEv: 0.03, staleHours: 3, slateDays: 3, wSide: 0.10, wTotal: 0.0, fairMethod: 'shin', evGate: 'worst',
   autoOddsMin: 60, showPreseason: false, warRoomUrl: WAR_ROOM_DEFAULT,
 };
 
@@ -316,6 +316,80 @@ const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const isInt = x => Math.abs(x - Math.round(x)) < 1e-9;
+
+/* FAIRPRICE:START (tests/fairPrice.test.js extracts this block, keep it free of app dependencies)
+   Fair (no vig) probabilities from a set of implied probabilities, one per outcome.
+   The methods follow the published ideas in github.com/mberk/shin and the implied module of
+   github.com/martineastwood/penaltyblog, both MIT licensed. Written here from the formulas;
+   no code was copied. */
+const fairPrice = (() => {
+  const METHODS = [
+    { key: 'shin', label: 'Shin', name: 'Shin' },
+    { key: 'multiplicative', label: 'Mult', name: 'Multiplicative' },
+    { key: 'additive', label: 'Add', name: 'Additive' },
+    { key: 'power', label: 'Power', name: 'Power' },
+  ];
+  const sum = a => a.reduce((x, y) => x + y, 0);
+  const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+  const american = a => a > 0 ? 100 / (a + 100) : -a / (-a + 100);
+  const decimal = d => 1 / d;
+  /* basic: divide each by the book sum */
+  function multiplicative(p) { const B = sum(p); return p.map(x => x / B); }
+  /* subtract an equal share of the margin; longshots that would go negative are floored, then renormalised */
+  function additive(p) {
+    const cut = (sum(p) - 1) / p.length;
+    const q = p.map(x => Math.max(x - cut, 1e-9)), B = sum(q);
+    return q.map(x => x / B);
+  }
+  /* raise each to a power k so the probabilities sum to 1 (k > 1 when there is vig) */
+  function power(p) {
+    const f = k => sum(p.map(x => Math.pow(x, k))) - 1;
+    let lo = 0.01, hi = 1;
+    while (f(hi) > 0 && hi < 1e4) hi *= 2;
+    for (let i = 0; i < 200; i++) { const mid = (lo + hi) / 2; if (f(mid) > 0) lo = mid; else hi = mid; }
+    const k = (lo + hi) / 2;
+    return { p: p.map(x => Math.pow(x, k)), k };
+  }
+  /* Shin: z is the share of insider money. Two outcomes have a closed form; three or more are iterated. */
+  function shinZ(p) {
+    const n = p.length, B = sum(p);
+    if (B <= 1) return 0;
+    if (n === 2) {
+      const d = p[0] - p[1], den = B * (d * d - 1);
+      if (Math.abs(den) < 1e-12) return 0;
+      return clamp(((B - 1) * (d * d - B)) / den, 0, 0.999);
+    }
+    let z = 0;
+    for (let i = 0; i < 1000; i++) {
+      const next = (sum(p.map(x => Math.sqrt(z * z + 4 * (1 - z) * x * x / B))) - 2) / (n - 2);
+      const nz = clamp(next, 0, 0.999), done = Math.abs(nz - z) < 1e-13; z = nz;
+      if (done) break;
+    }
+    return z;
+  }
+  function shin(p) {
+    const B = sum(p), z = shinZ(p);
+    if (z <= 0) return { p: p.map(x => x / B), z: 0 };
+    const q = p.map(x => (Math.sqrt(z * z + 4 * (1 - z) * x * x / B) - z) / (2 * (1 - z))), S = sum(q);
+    return { p: q.map(x => x / S), z };
+  }
+  /* devig(probs, method) -> fair probabilities that sum to 1 */
+  function devig(p, method) {
+    if (method === 'additive') return additive(p);
+    if (method === 'power') return power(p).p;
+    if (method === 'shin') return shin(p).p;
+    return multiplicative(p);
+  }
+  const fromAmerican = (odds, method) => devig(odds.map(american), method);
+  const fromDecimal = (odds, method) => devig(odds.map(decimal), method);
+  /* the lowest value across a list; the EV gate uses it on EV, which falls as fair probability falls */
+  const worst = vals => Math.min(...vals);
+  const label = key => (METHODS.find(m => m.key === key) || METHODS[0]).label;
+  const name = key => (METHODS.find(m => m.key === key) || METHODS[0]).name;
+  const valid = key => METHODS.some(m => m.key === key);
+  return { METHODS, multiplicative, additive, power, shin, shinZ, devig, fromAmerican, fromDecimal, worst, label, name, valid };
+})();
+/* FAIRPRICE:END */
 
 /* Normal distribution */
 function erf(x) { // Abramowitz and Stegun 7.1.26
@@ -525,19 +599,21 @@ function centerFromQuote(market, side, line, pNoVig) {
   }
   return (lo + hi) / 2;
 }
-function noVig(a, b) { const pa = amToProb(a), pb = amToProb(b); return pa / (pa + pb); }
+/* fair probability of the first side of a two way quote; multiplicative is the original behaviour */
+function noVig(a, b, method = 'multiplicative') { return fairPrice.fromAmerican([a, b], method)[0]; }
 
-/* consensus across books for one game. books: {key:{ml:{h,a}, sp:{h:{pt,pr},a:{pt,pr}}, to:{o:{pt,pr},u:{pt,pr}}}} */
-function consensus(books) {
+/* consensus across books for one game. books: {key:{ml:{h,a}, sp:{h:{pt,pr},a:{pt,pr}}, to:{o:{pt,pr},u:{pt,pr}}}}
+   method: the fair price method used to take the vig out of each quote */
+function consensus(books, method = 'multiplicative') {
   const Ms = [], Ts = [], mlp = [], spL = [], toL = [];
   for (const k in books) {
     const q = books[k];
-    if (q.ml && fin(q.ml.h) && fin(q.ml.a)) mlp.push(noVig(q.ml.h, q.ml.a));
+    if (q.ml && fin(q.ml.h) && fin(q.ml.a)) mlp.push(noVig(q.ml.h, q.ml.a, method));
     if (q.sp && q.sp.h && q.sp.a && fin(q.sp.h.pt) && fin(q.sp.h.pr) && fin(q.sp.a.pr)) {
-      Ms.push(centerFromQuote('spread', 'home', q.sp.h.pt, noVig(q.sp.h.pr, q.sp.a.pr))); spL.push(q.sp.h.pt);
+      Ms.push(centerFromQuote('spread', 'home', q.sp.h.pt, noVig(q.sp.h.pr, q.sp.a.pr, method))); spL.push(q.sp.h.pt);
     }
     if (q.to && q.to.o && q.to.u && fin(q.to.o.pt) && fin(q.to.o.pr) && fin(q.to.u.pr)) {
-      Ts.push(centerFromQuote('total', 'over', q.to.o.pt, noVig(q.to.o.pr, q.to.u.pr))); toL.push(q.to.o.pt);
+      Ts.push(centerFromQuote('total', 'over', q.to.o.pt, noVig(q.to.o.pr, q.to.u.pr, method))); toL.push(q.to.o.pt);
     }
   }
   const mlP = median(mlp);
@@ -864,6 +940,16 @@ function sideLabel(E, market, side, line) {
   if (market === 'total') return `${side === 'over' ? 'Over' : 'Under'} ${totStr(line)}`;
   return `${t.abbr} ML`;
 }
+/* EV of a price under every fair price method. The EV gate is the lowest of them (the lowest fair
+   probability for the side being bet), or the displayed method's EV when the gate is set to follow it. */
+function gatedEv(fx, market, side, line, price) {
+  const center = (mk, f) => mk === 'spread' ? f.M : mk === 'total' ? f.T : f.Mml;
+  const by = {};
+  for (const { key } of fairPrice.METHODS) by[key] = evAt(outcome(market, side, line, center(market, fx.byMethod[key].fair)), price);
+  if (fx.gate === 'display') return { ev: by[fx.dm], method: fx.dm, by };
+  const ev = fairPrice.worst(Object.values(by));
+  return { ev, method: Object.keys(by).find(k => by[k] === ev), by };
+}
 function evalGame(g) {
   const key = g.id; if (S.evals[key]) return S.evals[key];
   const st = S.settings;
@@ -876,13 +962,21 @@ function evalGame(g) {
   const ev = S.odds && matchOdds(g, S.odds.events);
   if (ev && Object.keys(ev.books).length) { books = orientBooks(ev); source = 'odds'; pricedAt = S.odds.t; }
   else if (g.espnOdds) { books = { espn: g.espnOdds }; source = 'espn'; pricedAt = S.slate[g.ymd] && S.slate[g.ymd].fetchedAt; }
-  const cons = consensus(books);
   const w = st.wSide, wt = st.wTotal;
-  const fair = {
-    M: fin(cons.M) ? cons.M + w * (proj.pm - cons.M) : proj.pm,
-    Mml: fin(cons.Mml) ? cons.Mml + w * (proj.pm - cons.Mml) : proj.pm,
-    T: fin(cons.T) ? cons.T + wt * (proj.pt - cons.T) : proj.pt,
-  };
+  /* one consensus and fair centre per devig method. The chosen method is what is displayed;
+     the EV gate looks across all of them (see gatedEv). */
+  const byMethod = {};
+  for (const { key } of fairPrice.METHODS) {
+    const c = consensus(books, key);
+    byMethod[key] = { cons: c, fair: {
+      M: fin(c.M) ? c.M + w * (proj.pm - c.M) : proj.pm,
+      Mml: fin(c.Mml) ? c.Mml + w * (proj.pm - c.Mml) : proj.pm,
+      T: fin(c.T) ? c.T + wt * (proj.pt - c.T) : proj.pt,
+    } };
+  }
+  const dm = fairPrice.valid(st.fairMethod) ? st.fairMethod : 'shin';
+  const fx = { byMethod, dm, gate: st.evGate === 'display' ? 'display' : 'worst' };
+  const { cons, fair } = byMethod[dm];
   const center = (mk, which) => mk === 'spread' ? which.M : mk === 'total' ? which.T : which.Mml;
   const modelC = { M: proj.pm, T: proj.pt, Mml: proj.pm };
   const started = (g.state && g.state !== 'pre') || now() >= Date.parse(g.date);
@@ -894,8 +988,8 @@ function evalGame(g) {
     for (const k of pool) {
       const q = quoteFor(books[k], market, side); if (!q) continue;
       const o = outcome(market, side, q.line, center(market, fair));
-      const e = evAt(o, q.price);
-      if (!best || e > best.ev + 1e-9) best = { ...q, book: k, bookTitle: books[k].title, o, ev: e };
+      const ge = gatedEv(fx, market, side, q.line, q.price);
+      if (!best || ge.ev > best.ev + 1e-9) best = { ...q, book: k, bookTitle: books[k].title, o, ev: ge.ev, evGate: ge.method, evBy: ge.by };
     }
     const line = best ? best.line : market === 'spread' ? (side === 'home' ? cons.spLine : fin(cons.spLine) ? -cons.spLine : null) : market === 'total' ? cons.toLine : null;
     const hasLine = market === 'ml' || fin(line);
@@ -910,7 +1004,7 @@ function evalGame(g) {
   const candidates = rows.filter(r => r.best && !started && !stale);
   const top = candidates.sort((a, b) => b.best.ev - a.best.ev)[0] || null;
   const pick = top && top.best.ev >= st.minEv ? top : null;
-  const E = { g, ht, at, R, proj, b2bh, b2ba, adj, books, source, pricedAt, cons, fair, rows, started, stale, pick, top, ...tierInfo,
+  const E = { g, ht, at, R, proj, b2bh, b2ba, adj, books, source, pricedAt, cons, fair, fx, rows, started, stale, pick, top, ...tierInfo,
     winFair: 1 - Phi(-fair.Mml / M.SD_ML), winModel: 1 - Phi(-proj.pm / M.SD_ML), winMkt: fin(cons.mlP) ? cons.mlP : null };
   return (S.evals[key] = E);
 }
@@ -1028,7 +1122,7 @@ function gameCard(E) {
     ${tl(at, g.arec || teamRecord(at.id), badge(E.b2ba, E.outA, E.qA), scoreA, pA, pA > 0.5)}
     ${tl(ht, g.hrec || teamRecord(ht.id), badge(E.b2bh, E.outH, E.qH), scoreH, pH, pH >= 0.5)}
     <div class="lane" aria-hidden="true"><span class="fill" style="width:${(100 * pA).toFixed(1)}%"></span><span class="mid"></span><span class="circle"></span>${tickM}${tickK}</div>
-    <div class="lane-key"><span><i style="background:var(--amber)"></i>Fair win chance</span><span><i style="background:var(--paint)"></i>Model <i style="background:var(--chalk);margin-left:8px"></i>Market</span></div>
+    <div class="lane-key"><span><i style="background:var(--amber)"></i>Fair win chance, ${fairPrice.label(E.fx.dm)}</span><span><i style="background:var(--paint)"></i>Model <i style="background:var(--chalk);margin-left:8px"></i>Market</span></div>
     <div class="g-foot">${lines}${pick}</div></button>`;
 }
 
@@ -1052,7 +1146,7 @@ function viewMarket() {
     <td>${E.top && !E.started ? `${esc(E.top.label)} ${amStr(E.top.best.price)} <span class="muted">${bookShort(E.top.best.book, E.top.best.bookTitle)}</span>` : '<span class="muted">--</span>'}</td>
     <td class="${fin(r.ev) ? (r.ev >= S.settings.minEv && !E.stale ? 'pos' : r.ev < 0 ? 'neg' : '') : ''}">${fin(r.ev) ? sgnPct(r.ev) : '--'}</td></tr>`; }).join('')}
   </tbody></table></div>
-  <p class="sub" style="margin-top:10px">Gap uses the pure model. Fair prices use the market plus ${Math.round(S.settings.wSide * 100)}% of the model on sides and ${Math.round(S.settings.wTotal * 100)}% on totals, which is all the backtest supports.</p>`;
+  <p class="sub" style="margin-top:10px">Gap uses the pure model. Fair prices use the market plus ${Math.round(S.settings.wSide * 100)}% of the model on sides and ${Math.round(S.settings.wTotal * 100)}% on totals, which is all the backtest supports. Fair prices take the vig out with the ${esc(fairPrice.name(S.settings.fairMethod))} method; ${S.settings.evGate === 'display' ? 'EV follows that method' : 'EV uses the lowest fair probability across all four methods'}.</p>`;
 }
 
 /* ---------- Game sheet ---------- */
@@ -1063,10 +1157,12 @@ function openGame(id) {
   const g = findGame(id); if (!g) return; S.openGame = id;
   const E = evalGame(g), { ht, at } = E;
   const fmtP = o => o ? pct(o.win, 1) : '--';
+  const evTitle = E.fx.gate === 'display' ? `EV under the ${fairPrice.name(E.fx.dm)} method` : 'EV gate: worst case, the lowest EV across all four fair price methods';
+  const evBreak = b => `${E.fx.gate === 'display' ? 'Follows ' + fairPrice.name(E.fx.dm) : 'Worst case: ' + fairPrice.name(b.evGate)}. ` + fairPrice.METHODS.map(m => `${m.name} ${sgnPct(b.evBy[m.key])}`).join(', ');
   const board = E.rows.map((r, i) => {
     const b = r.best;
     return `<tr><td><div class="side-cell"><span>${esc(r.label)}</span>${b && !E.started ? `<button class="btn small" data-logbet="${i}" aria-label="Log ${esc(r.label)}">Log</button>` : ''}</div></td><td>${b ? `${amStr(b.price)} <span class="book">${esc(bookShort(b.book, b.bookTitle))}</span>` : '<span class="muted">--</span>'}</td>
-      <td class="${b ? (b.ev >= S.settings.minEv && !E.stale ? 'pos' : b.ev < 0 ? 'neg' : '') : ''}">${b ? sgnPct(b.ev) : '--'}</td><td>${fmtP(b ? b.o : r.fair)}</td><td>${r.mkt ? pct(r.mkt.win, 1) : '--'}</td><td>${pct(r.model.win, 1)}</td></tr>`;
+      <td class="${b ? (b.ev >= S.settings.minEv && !E.stale ? 'pos' : b.ev < 0 ? 'neg' : '') : ''}"${b ? ` title="${esc(evBreak(b))}"` : ''}>${b ? sgnPct(b.ev) : '--'}</td><td>${fmtP(b ? b.o : r.fair)}</td><td>${r.mkt ? pct(r.mkt.win, 1) : '--'}</td><td>${pct(r.model.win, 1)}</td></tr>`;
   }).join('');
   const bookKeys = Object.keys(E.books).sort((a, b) => (S.settings.myBooks.includes(b) - S.settings.myBooks.includes(a)) || a.localeCompare(b));
   const cell = (q, mk, sd) => { const x = quoteFor(q, mk, sd); if (!x) return '<td class="muted">--</td>'; const r = E.rows.find(r => r.market === mk && r.side === sd); const isBest = r && r.best && r.best.book && E.books[r.best.book] === q; return `<td${isBest ? ' class="pos"' : ''}>${mk === 'ml' ? '' : (mk === 'total' ? totStr(x.line) : lineStr(x.line)) + ' '}${amStr(x.price)}</td>`; };
@@ -1084,19 +1180,19 @@ function openGame(id) {
   <div class="section kv">
     <div><span>Model, ${ht.abbr} margin</span><b>${sgn(E.proj.pm)}</b></div>
     <div><span>Market margin</span><b>${fin(E.cons.M) ? sgn(E.cons.M) : '--'}</b></div>
-    <div><span>Fair margin</span><b>${sgn(E.fair.M)}</b></div>
+    <div><span>Fair margin, ${fairPrice.label(E.fx.dm)}</span><b>${sgn(E.fair.M)}</b></div>
     <div><span>Model total</span><b>${E.proj.pt.toFixed(1)}</b></div>
     <div><span>Market total</span><b>${fin(E.cons.T) ? E.cons.T.toFixed(1) : '--'}</b></div>
-    <div><span>${ht.abbr} fair win</span><b>${pct(E.winFair, 1)}</b></div>
+    <div><span>${ht.abbr} fair win, ${fairPrice.label(E.fx.dm)}</span><b>${pct(E.winFair, 1)}</b></div>
   </div>
   ${E.flags.length ? `<p class="sub">Read ${E.tier}. ${E.flags.map(f => f.replace(/_/g, ' ')).join(', ')}.</p>` : `<p class="sub">Read ${E.tier}.</p>`}
   <div class="section"><h3 style="margin-bottom:8px">Board</h3>
-  <div class="tbl-wrap board"><table><thead><tr><th>Side</th><th>Best price</th><th>EV</th><th title="Win chance under the fair price">Fair</th><th title="Market consensus, no vig, at this line">No vig</th><th title="Pure model at this line">Model</th></tr></thead><tbody>${board}</tbody></table></div>
+  <div class="tbl-wrap board"><table><thead><tr><th>Side</th><th>Best price</th><th title="${esc(evTitle)}">EV</th><th title="Win chance under the fair price, ${esc(fairPrice.name(E.fx.dm))} method">Fair, ${fairPrice.label(E.fx.dm)}</th><th title="Market consensus, no vig, at this line, ${esc(fairPrice.name(E.fx.dm))} method">No vig, ${fairPrice.label(E.fx.dm)}</th><th title="Pure model at this line">Model</th></tr></thead><tbody>${board}</tbody></table></div>
   <p class="sub" style="margin-top:6px">${E.rows[0].ownBooks ? 'Best price is the highest EV quote across your books.' : 'None of your books has this game, so the best price comes from any book.'} Whole number lines carry a push (about ${(BACKTEST.push.spreadInt * 100).toFixed(1)}% on spreads, ${(BACKTEST.push.totalInt * 100).toFixed(1)}% on totals), which EV accounts for. ${move}</p></div>
   <div class="section"><h3 style="margin-bottom:8px">Every book</h3>${booksTbl}</div>
   <div class="section grid2">
-    <div><h3 style="margin-bottom:8px">${ht.abbr} spread ladder</h3><div class="tbl-wrap"><table><thead><tr><th>Line</th><th>Cover</th><th>Push</th><th>Fair price</th></tr></thead><tbody>${ladder('spread', 'home', Math.round((fin(hRow.line) ? hRow.line : -E.fair.M) * 2) / 2, E.fair.M)}</tbody></table></div></div>
-    <div><h3 style="margin-bottom:8px">Over ladder</h3><div class="tbl-wrap"><table><thead><tr><th>Total</th><th>Over</th><th>Push</th><th>Fair price</th></tr></thead><tbody>${ladder('total', 'over', Math.round((fin(tRow.line) ? tRow.line : E.fair.T) * 2) / 2, E.fair.T)}</tbody></table></div></div>
+    <div><h3 style="margin-bottom:8px">${ht.abbr} spread ladder</h3><div class="tbl-wrap"><table><thead><tr><th>Line</th><th>Cover</th><th>Push</th><th>Fair price, ${fairPrice.label(E.fx.dm)}</th></tr></thead><tbody>${ladder('spread', 'home', Math.round((fin(hRow.line) ? hRow.line : -E.fair.M) * 2) / 2, E.fair.M)}</tbody></table></div></div>
+    <div><h3 style="margin-bottom:8px">Over ladder</h3><div class="tbl-wrap"><table><thead><tr><th>Total</th><th>Over</th><th>Push</th><th>Fair price, ${fairPrice.label(E.fx.dm)}</th></tr></thead><tbody>${ladder('total', 'over', Math.round((fin(tRow.line) ? tRow.line : E.fair.T) * 2) / 2, E.fair.T)}</tbody></table></div></div>
   </div>
   <div class="section"><h3>Injury report</h3><p class="sub">From ESPN, ${S.injuries ? 'updated ' + fmtAgo(S.injuries.fetchedAt) : 'not loaded'}. The model cannot see who plays; the market can.</p>${inj(at)}${inj(ht)}</div>
   <div class="section panel"><h3>Your adjustment</h3>
@@ -1191,6 +1287,8 @@ function viewSettings() {
       <div class="field"><label for="staleHours">Prices go stale after, hours</label><input id="staleHours" type="number" step="0.5" min="0.5" value="${st.staleHours}"></div>
       <div class="field"><label for="wSide">Model weight on spreads and moneylines, %</label><input id="wSide" type="number" step="1" min="0" max="100" value="${Math.round(st.wSide * 100)}"><span class="hint">Backtest supports about 8 to 14. Default 10.</span></div>
       <div class="field"><label for="wTotal">Model weight on totals, %</label><input id="wTotal" type="number" step="1" min="0" max="100" value="${Math.round(st.wTotal * 100)}"><span class="hint">Backtest found no value out of sample. Default 0.</span></div>
+      <div class="field"><label for="fairMethod">Fair price method</label><select id="fairMethod">${fairPrice.METHODS.map(m => `<option value="${m.key}" ${st.fairMethod === m.key ? 'selected' : ''}>${m.name}${m.key === 'shin' ? ' (default)' : ''}</option>`).join('')}</select><span class="hint">How the vig is taken out of a quote. Sets the fair prices you see.</span></div>
+      <div class="field"><label for="evGate">EV gate</label><select id="evGate"><option value="worst" ${st.evGate !== 'display' ? 'selected' : ''}>Worst case (default)</option><option value="display" ${st.evGate === 'display' ? 'selected' : ''}>Follow the fair price method</option></select><span class="hint">Worst case uses the lowest fair probability across all four methods for every EV flag and bar.</span></div>
       <div class="field"><label for="unit">Unit size, $</label><input id="unit" type="number" step="1" min="1" value="${st.unit}"></div>
       <div class="field"><label for="slateDays">Days on the slate</label><input id="slateDays" type="number" step="1" min="1" max="7" value="${st.slateDays}"></div>
     </div>
@@ -1235,12 +1333,14 @@ async function saveBet(gameId, rowIdx) {
   if (r.market !== 'ml' && !fin(line)) return toast('Enter the line you got.');
   if (!fin(stake) || stake <= 0) return toast('Enter a stake in units.');
   const fo = outcome(r.market, r.side, line, centerOf(r.market, E.fair));
-  const cc = centerOf(r.market, E.cons);
+  const ge = gatedEv(E.fx, r.market, r.side, line, price);
+  /* shopping value is measured against the multiplicative consensus, the same basis as the saved price history and closing line value */
+  const cc = centerOf(r.market, E.fx.byMethod.multiplicative.cons);
   const ko = fin(cc) ? outcome(r.market, r.side, line, cc) : null;
   const bet = {
     id: uid(), gameId: g.id, ymd: g.ymd, start: g.date, home: g.home, away: g.away, market: r.market, side: r.side, line, price,
     book: $('#bBook').value, stake, note: $('#bNote').value.trim(), placedAt: now(), label: sideLabel(E, r.market, r.side, line),
-    fairWin: fo.win, fairPush: fo.push, evFair: evAt(fo, price), evCons: ko ? evAt(ko, price) : null, consCenter: fin(cc) ? cc : null,
+    fairWin: fo.win, fairPush: fo.push, evFair: ge.ev, evFairMethod: ge.method, fairMethod: E.fx.dm, evBy: ge.by, evCons: ko ? evAt(ko, price) : null, consCenter: fin(cc) ? cc : null,
     status: 'open', pl: 0, clv: null, closeAt: null,
   };
   S.bets.unshift(bet); await saveBets();
@@ -1436,6 +1536,7 @@ function readSettingsForm() {
   st.minEv = clamp(parseFloat($('#minEv').value) / 100 || 0, 0, 0.5);
   st.staleHours = clamp(parseFloat($('#staleHours').value) || 3, 0.5, 48);
   st.wSide = clamp((parseFloat($('#wSide').value) || 0) / 100, 0, 1); st.wTotal = clamp((parseFloat($('#wTotal').value) || 0) / 100, 0, 1);
+  st.fairMethod = fairPrice.valid($('#fairMethod').value) ? $('#fairMethod').value : 'shin'; st.evGate = $('#evGate').value === 'display' ? 'display' : 'worst';
   st.unit = Math.max(1, parseFloat($('#unit').value) || 10); st.slateDays = clamp(parseInt($('#slateDays').value, 10) || 3, 1, 7);
   st.showPreseason = $('#showPreseason').checked; st.warRoomUrl = $('#warRoomUrl').value.trim() || WAR_ROOM_DEFAULT;
   return st;
